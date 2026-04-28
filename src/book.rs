@@ -1,7 +1,14 @@
 use crate::AccountType;
 
+pub enum BalanceType {
+    Current,
+    Available,
+    Hold,
+}
+
 struct Book {
     accounting_type: AccountType,
+    // TODO maybe i64 is more appropriate
     cover_mirror: i32,
     durable_unapplied: Vec<BookRecord>,
     pending_write: Vec<BookRecord>,
