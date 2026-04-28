@@ -1,23 +1,20 @@
+use rocket::serde::Deserialize;
 use crate::AccountType;
 
-pub enum BalanceType {
-    Current,
-    Available,
-    Hold,
-}
 
-struct Book {
-    accounting_type: AccountType,
+
+pub struct Book {
+    pub accounting_type: AccountType,
     // TODO maybe i64 is more appropriate
-    cover_mirror: i32,
-    durable_unapplied: Vec<BookRecord>,
-    pending_write: Vec<BookRecord>,
+    pub cover_mirror: i32,
+    pub durable_unapplied: Vec<BookRecord>,
+    pub pending_write: Vec<BookRecord>,
 }
-struct BookRecord {
-    accounting_type: AccountType,
-    amount: i32,
-    ledger_code: String,
-    operation_id: String,
+pub struct BookRecord {
+    pub accounting_type: AccountType,
+    pub amount: i32,
+    pub ledger_code: String,
+    pub operation_id: String,
 }
 
 impl Book {
@@ -30,7 +27,7 @@ impl Book {
         }
     }
 
-    fn get_balance(&self) -> i32 {
+    pub(crate) fn get_balance(&self) -> i32 {
         let durable_balance = self
             .durable_unapplied
             .iter()
