@@ -3,14 +3,14 @@ extern crate rocket;
 
 use crate::ApiError::{SystemError, Unprocessable};
 use crate::acceptor_task::OperationResult::{Accepted, Rejected};
-use crate::acceptor_task::{AcceptorHandle, ValidOperation};
+use crate::acceptor_task::{AcceptorHandle, InvalidOperationError, ValidOperation};
 use rocket::State;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 
 mod acceptor_task;
 type AccountId = u32;
-
+type Currency = String;
 #[derive(Deserialize, Serialize, Copy, Clone, Debug)]
 enum AccountType {
     DEBIT,
@@ -35,6 +35,7 @@ struct OperationEntry {
     balance_type: BalanceType,
     op_type: AccountType,
     amount: i128,
+    currency: Currency,
 }
 
 #[derive(Serialize)]
@@ -61,16 +62,20 @@ enum ApiError {
     SystemError(String),
 }
 
+impl From<InvalidOperationError> for ApiError {
+    fn from(value: InvalidOperationError) -> Self {
+        //TODO add more info
+        //TODO "to_string" is good?
+        ApiError::BadRequest("request validation failed".to_string())
+    }
+}
 #[post("/operations", format = "application/json", data = "<operation>")]
 async fn post_operations(
     operation: Json<Operation>,
     acceptor_handle: &State<AcceptorHandle>, //This shouldn't be
 ) -> Result<Json<OperationResult>, ApiError> {
-    //TODO react to validation error
-    match acceptor_handle
-        .submit(ValidOperation::parse(operation.0).unwrap())
-        .await
-    {
+    let valid_op = ValidOperation::parse(operation.0)?;
+    match acceptor_handle.submit(valid_op).await {
         Ok(Accepted(balances)) => Ok(Json(OperationResult {
             //TODO refactor this to a better mapping
             resulting_balances: balances

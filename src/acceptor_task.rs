@@ -26,8 +26,23 @@ pub struct ValidOperation(Operation);
 
 impl ValidOperation {
     pub fn parse(op: Operation) -> Result<Self, InvalidOperationError> {
-        // TODO validate amounts, zero-sum
-        Ok(Self(op))
+        let entries = &op.entries;
+        let mut totals = HashMap::new();
+        for entry in entries {
+            if entry.amount == 0 {
+                return Err(InvalidOperationError);
+            }
+            let currency_total = totals.entry(&entry.currency).or_insert(0);
+            *currency_total += match entry.op_type {
+                AccountType::DEBIT => -entry.amount,
+                AccountType::CREDIT => entry.amount,
+            }
+        }
+        if totals.iter().any(|(_, total)| *total != 0) {
+            Err(InvalidOperationError)
+        } else {
+            Ok(Self(op))
+        }
     }
 }
 
