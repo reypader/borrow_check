@@ -1,38 +1,41 @@
 #[macro_use]
 extern crate rocket;
 
-use crate::book::{Book, BookRecord};
+use crate::acceptor_task::OperationResult::{Accepted, Rejected};
+use crate::acceptor_task::{Acceptor, AcceptorHandle, ValidOperation, Writer};
+use crate::ApiError::{SystemError, Unprocessable};
 use rocket::serde::json::Json;
+use rocket::State;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use tokio::sync::mpsc;
 
-mod book;
-mod journal;
+mod acceptor_task;
+type AccountId = u32;
 
-#[derive(Deserialize, Serialize, Copy, Clone)]
+#[derive(Deserialize, Serialize, Copy, Clone, Debug)]
 enum AccountType {
     DEBIT,
     CREDIT,
 }
 
-#[derive(Deserialize)]
-struct Operation {
-    entries: Vec<OperationEntry>,
-}
-
-#[derive(Deserialize)]
-struct OperationEntry {
-    account: u32,
-    balance_type: BalanceType,
-    op_type: AccountType,
-    amount: i32,
-}
-
-#[derive(Deserialize, Serialize, Eq, Hash, PartialEq, Copy, Clone)]
+#[derive(Deserialize, Serialize, Eq, Hash, PartialEq, Copy, Clone, Debug)]
 pub enum BalanceType {
     Current,
     Available,
     Hold,
+}
+
+#[derive(Deserialize, Debug)]
+struct Operation {
+    entries: Vec<OperationEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OperationEntry {
+    account: AccountId,
+    balance_type: BalanceType,
+    op_type: AccountType,
+    amount: i128,
 }
 
 #[derive(Serialize)]
@@ -44,88 +47,66 @@ struct OperationResult {
 struct BalanceDescriptor {
     account: u32,
     balance_type: BalanceType,
-    balance: i32,
+    balance: i128,
+}
+
+#[derive(Responder)]
+enum ApiError {
+    #[response(status = 400)]
+    BadRequest(String),
+    #[response(status = 404)]
+    NotFound(String),
+    #[response(status = 422)]
+    Unprocessable(String),
+    #[response(status = 500)]
+    SystemError(String),
 }
 
 #[post("/operations", format = "application/json", data = "<operation>")]
-fn post_operations(operation: Json<Operation>) -> Json<OperationResult> {
-    let mut book_registry = HashMap::with_capacity(2);
-    book_registry.insert(
-        (1u32, BalanceType::Available),
-        Book { //actually starts at 150
-            accounting_type: AccountType::CREDIT,
-            cover_mirror: 100,
-            durable_unapplied: vec![
-                BookRecord {
-                    accounting_type: AccountType::DEBIT,
-                    amount: 100,
-                    ledger_code: String::from("L1"),
-                    operation_id: String::from("OP1"),
-                },
-                BookRecord {
-                    accounting_type: AccountType::CREDIT,
-                    amount: 150,
-                    ledger_code: String::from("L4"),
-                    operation_id: String::from("OP4"),
-                },
-            ],
-            pending_write: vec![],
-        },
-    );
-
-    book_registry.insert(
-        (2u32, BalanceType::Available),
-        Book { //actually starts at 250
-            accounting_type: AccountType::CREDIT,
-            cover_mirror: 100,
-            durable_unapplied: vec![
-                BookRecord {
-                    accounting_type: AccountType::DEBIT,
-                    amount: 100,
-                    ledger_code: String::from("L1"),
-                    operation_id: String::from("OP1"),
-                },
-                BookRecord {
-                    accounting_type: AccountType::CREDIT,
-                    amount: 250,
-                    ledger_code: String::from("L4"),
-                    operation_id: String::from("OP4"),
-                },
-            ],
-            pending_write: vec![],
-        },
-    );
-    let mut operation_totals = HashMap::with_capacity(operation.entries.len());
-    operation.entries.iter().for_each(|entry| {
-        let debit_credit = operation_totals.entry(entry.account).or_insert((0, 0));
-        *debit_credit = match entry.op_type {
-            AccountType::DEBIT => (debit_credit.0 + entry.amount, debit_credit.1),
-            AccountType::CREDIT => (debit_credit.0, debit_credit.1 + entry.amount),
-        };
-        let book = (entry.account, entry.balance_type);
-        match book_registry.get_mut(&book) {
-            None => panic!("No registered book found"),
-            Some(b) => b.pending_write.push(BookRecord {
-                accounting_type: entry.op_type,
-                amount: entry.amount,
-                ledger_code: "L1".to_string(),
-                operation_id: "OP1".to_string(),
-            }),
-        };
-    });
-
-    let mut resulting_balances = Vec::new();
-    for x in book_registry {
-        resulting_balances.push(BalanceDescriptor {
-            account: x.0.0,
-            balance_type: x.0.1,
-            balance: x.1.get_balance(),
-        });
+async fn post_operations(
+    operation: Json<Operation>,
+    acceptor_handle: &State<AcceptorHandle>, //This shouldn't be
+) -> Result<Json<OperationResult>, ApiError> {
+    //TODO react to validation error
+    match acceptor_handle
+        .submit(ValidOperation::parse(operation.0).unwrap())
+        .await
+    {
+        Ok(Accepted(balances)) => Ok(Json(OperationResult {
+            //TODO refactor this to a better mapping
+            resulting_balances: balances
+                .into_iter()
+                .map(|x| BalanceDescriptor {
+                    account: x.0,
+                    balance_type: BalanceType::Current,
+                    balance: x.1,
+                })
+                .collect(),
+        })),
+        Ok(Rejected(offending_account_id)) => Err(Unprocessable(format!(
+            "Account {:?} does not have enough balance",
+            offending_account_id
+        ))),
+        Err(x) => Err(SystemError(format!("system error: {:?}", x))),
     }
-    Json(OperationResult { resulting_balances })
 }
 
-#[launch]
-fn rocket() -> _ {
-    rocket::build().mount("/", routes![post_operations])
+#[rocket::main]
+async fn main() {
+    let (writer_tx, writer_rx) = mpsc::channel(5);
+    let writer = Writer { rx: writer_rx };
+    tokio::spawn(writer.writer_task());
+
+    let (acceptor_tx, acceptor_rx) = mpsc::channel(5);
+    let acceptor = Acceptor {
+        buffer: Vec::with_capacity(10),
+        writer_tx,
+        rx: acceptor_rx,
+    };
+    tokio::spawn(acceptor.acceptor_task());
+    let _ = rocket::build()
+        .manage(AcceptorHandle { tx: acceptor_tx })
+        .mount("/", routes![post_operations])
+        .launch()
+        .await;
 }
