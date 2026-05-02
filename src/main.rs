@@ -1,13 +1,12 @@
 #[macro_use]
 extern crate rocket;
 
-use crate::acceptor_task::OperationResult::{Accepted, Rejected};
-use crate::acceptor_task::{Acceptor, AcceptorHandle, ValidOperation, Writer};
 use crate::ApiError::{SystemError, Unprocessable};
-use rocket::serde::json::Json;
+use crate::acceptor_task::OperationResult::{Accepted, Rejected};
+use crate::acceptor_task::{AcceptorHandle, ValidOperation};
 use rocket::State;
+use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 mod acceptor_task;
 type AccountId = u32;
@@ -93,19 +92,9 @@ async fn post_operations(
 
 #[rocket::main]
 async fn main() {
-    let (writer_tx, writer_rx) = mpsc::channel(5);
-    let writer = Writer { rx: writer_rx };
-    tokio::spawn(writer.writer_task());
-
-    let (acceptor_tx, acceptor_rx) = mpsc::channel(5);
-    let acceptor = Acceptor {
-        buffer: Vec::with_capacity(10),
-        writer_tx,
-        rx: acceptor_rx,
-    };
-    tokio::spawn(acceptor.acceptor_task());
+    let acceptor_handle = acceptor_task::spawn(5, 5);
     let _ = rocket::build()
-        .manage(AcceptorHandle { tx: acceptor_tx })
+        .manage(acceptor_handle)
         .mount("/", routes![post_operations])
         .launch()
         .await;

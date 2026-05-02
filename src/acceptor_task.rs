@@ -6,6 +6,21 @@ use thiserror::Error;
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 
+pub fn spawn(buffer_capacity: usize, channel_capacity: usize) -> AcceptorHandle {
+    let (writer_tx, writer_rx) = mpsc::channel(channel_capacity);
+    let writer = Writer { rx: writer_rx };
+    tokio::spawn(writer.writer_task());
+
+    let (acceptor_tx, acceptor_rx) = mpsc::channel(channel_capacity);
+    let acceptor = Acceptor {
+        buffer: Vec::with_capacity(buffer_capacity),
+        writer_tx,
+        rx: acceptor_rx,
+    };
+    tokio::spawn(acceptor.acceptor_task());
+    AcceptorHandle { tx: acceptor_tx }
+}
+
 #[derive(Debug)]
 pub struct ValidOperation(Operation);
 
@@ -38,14 +53,13 @@ impl From<oneshot::error::RecvError> for OperationError {
         OperationError::AcceptorSystemFailure
     }
 }
-
-pub struct Writer {
+struct Writer {
     //TODO make these private and instead create a constructor
-    pub rx: mpsc::Receiver<WriterBuffer>,
+    rx: mpsc::Receiver<WriterBuffer>,
 }
 
 impl Writer {
-    pub async fn writer_task(mut self) {
+    async fn writer_task(mut self) {
         loop {
             tokio::select! {
                 Some(mut write_buffer) = self.rx.recv() => {
@@ -60,11 +74,11 @@ impl Writer {
 }
 
 type WriterBuffer = Vec<WriteCommand>;
-pub struct Acceptor {
+struct Acceptor {
     //TODO make these private and instead create a constructor
-    pub buffer: WriterBuffer,
-    pub writer_tx: mpsc::Sender<WriterBuffer>,
-    pub rx: mpsc::Receiver<AcceptorCommand>,
+    buffer: WriterBuffer,
+    writer_tx: mpsc::Sender<WriterBuffer>,
+    rx: mpsc::Receiver<AcceptorCommand>,
 }
 
 impl Acceptor {
@@ -99,8 +113,8 @@ impl Acceptor {
             Ok(_) => (),
             Err(_) => {
                 self.rx.close();
-                while let Some(inFlight) = self.rx.recv().await {
-                    inFlight.abort()
+                while let Some(in_flight) = self.rx.recv().await {
+                    in_flight.abort()
                 }
                 for pending in self.buffer.drain(..) {
                     pending.abort(OperationError::WriterSystemFailure)
@@ -109,7 +123,7 @@ impl Acceptor {
         }
     }
 
-    pub async fn acceptor_task(mut self) {
+    async fn acceptor_task(mut self) {
         // Start receiving messages
         loop {
             tokio::select! {
@@ -158,7 +172,7 @@ impl Display for OperationError {
 }
 
 #[derive(Debug)]
-pub struct AcceptorCommand {
+struct AcceptorCommand {
     operations: ValidOperation,
     response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
 }
@@ -174,7 +188,7 @@ impl AcceptorCommand {
 #[derive(Clone)]
 pub struct AcceptorHandle {
     //TODO make these private and instead create a constructor
-    pub tx: mpsc::Sender<AcceptorCommand>,
+    tx: mpsc::Sender<AcceptorCommand>,
 }
 
 impl AcceptorHandle {
@@ -199,7 +213,7 @@ pub enum OperationResult {
 }
 
 #[derive(Debug)]
-pub struct WriteCommand {
+struct WriteCommand {
     content: String,
     ending_balances: HashMap<AccountId, i128>,
     response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
