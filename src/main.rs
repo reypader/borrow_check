@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate rocket;
 
+use std::time::Duration;
+
 use crate::ApiError::{SystemError, Unprocessable};
 use crate::acceptor_task::OperationResult::{Accepted, Rejected};
 use crate::acceptor_task::{AcceptorHandle, InvalidOperationError, ValidOperation};
@@ -63,7 +65,7 @@ enum ApiError {
 }
 
 impl From<InvalidOperationError> for ApiError {
-    fn from(value: InvalidOperationError) -> Self {
+    fn from(_value: InvalidOperationError) -> Self {
         //TODO add more info
         //TODO "to_string" is good?
         ApiError::BadRequest("request validation failed".to_string())
@@ -97,7 +99,7 @@ async fn post_operations(
 
 #[rocket::main]
 async fn main() {
-    let acceptor_handle = acceptor_task::spawn(5, 5);
+    let acceptor_handle = acceptor_task::spawn(5, 5, Duration::from_millis(10));
     let _ = rocket::build()
         .manage(acceptor_handle)
         .mount("/", routes![post_operations])

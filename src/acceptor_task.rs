@@ -2,11 +2,17 @@ use crate::{AccountId, AccountType, Operation};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::mem::replace;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Instant, sleep};
 
-pub fn spawn(buffer_capacity: usize, channel_capacity: usize) -> AcceptorHandle {
+pub fn spawn(
+    buffer_capacity: usize,
+    channel_capacity: usize,
+    manual_flush_after: Duration,
+) -> AcceptorHandle {
     let (writer_tx, writer_rx) = mpsc::channel(channel_capacity);
     let writer = Writer { rx: writer_rx };
     tokio::spawn(writer.writer_task());
@@ -17,7 +23,7 @@ pub fn spawn(buffer_capacity: usize, channel_capacity: usize) -> AcceptorHandle 
         writer_tx,
         rx: acceptor_rx,
     };
-    tokio::spawn(acceptor.acceptor_task());
+    tokio::spawn(acceptor.acceptor_task(manual_flush_after));
     AcceptorHandle { tx: acceptor_tx }
 }
 
@@ -122,7 +128,7 @@ impl Acceptor {
     }
 
     async fn flush(&mut self) {
-        let buffer_size = self.buffer.len();
+        let buffer_size = self.buffer.capacity();
         let buffer_to_flush = replace(&mut self.buffer, Vec::with_capacity(buffer_size));
         match self.writer_tx.send(buffer_to_flush).await {
             Ok(_) => (),
@@ -138,30 +144,44 @@ impl Acceptor {
         }
     }
 
-    async fn acceptor_task(mut self) {
+    async fn acceptor_task(mut self, manual_flush_after: Duration) {
         // Start receiving messages
+        let flush_timer = sleep(manual_flush_after);
+        tokio::pin!(flush_timer);
         loop {
             tokio::select! {
-                Some(cmd) = self.rx.recv() => {
-                    self.handle(cmd).await;
+                    biased; // always prioritize trying to "receive" a message
+                    Some(cmd) = self.rx.recv() => {
+                        let buffer_was_empty = self.buffer.is_empty();
 
-                    //TODO reset manual flushing schedule
+                        // TODO assess handle returning boolean vs self.buffer.is_empty()
+                        self.handle(cmd).await;
 
-                    if self.buffer.len() == 10 {
-                       self.flush().await;
+                        if buffer_was_empty && !self.buffer.is_empty() {
+                            flush_timer.as_mut().reset(Instant::now() + manual_flush_after);
+                        }
+
+                        if self.buffer.len() == self.buffer.capacity() {
+                            //TODO use standard logging
+                            println!("Full-flushing {}", self.buffer.len());
+                           self.flush().await;
+                        }
+                    }
+
+                    _  = &mut flush_timer, if !self.buffer.is_empty() => {
+                        //TODO use standard logging
+                         println!("Timed flushing {}", self.buffer.len());
+                         self.flush().await;
+                    }
+
+                    //TODO Add other shutdown signals?
+                    _ = signal::ctrl_c()  => {
+                        if !self.buffer.is_empty() {
+                            self.flush().await;
+                        }
+                        break;
                     }
                 }
-
-                //TODO scheduled manual flush
-
-                //TODO Add other shutdown signals?
-                _ =signal::ctrl_c()  => {
-                    if !self.buffer.is_empty() {
-                        self.flush().await;
-                    }
-                    break;
-                }
-            }
         }
     }
 }
