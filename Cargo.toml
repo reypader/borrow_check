@@ -8,3 +8,4 @@ rocket = { version = "0.5.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = "1.52.1"
+uuid = { version = "1.23.1", features = ["serde"] }
