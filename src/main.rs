@@ -78,6 +78,7 @@ impl From<InvalidOperationError> for ApiError {
     }
 }
 
+#[derive(Debug)]
 struct Account {
     account_type: AccountType,
     books: HashMap<(Currency, BalanceType), BookId>,

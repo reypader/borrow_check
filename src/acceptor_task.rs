@@ -1,6 +1,5 @@
 use crate::{Account, AccountId, BalanceType, BookId, Currency, Operation};
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
 use std::mem::replace;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -33,6 +32,7 @@ pub fn spawn(
 #[derive(Debug)]
 pub struct ValidOperation {
     idempotency_key: Uuid,
+    accounts_in_scope: HashMap<AccountId, Account>,
     entries: Vec<PreProcessedEntry>,
 }
 
@@ -120,6 +120,7 @@ impl ValidOperation {
         } else {
             Ok(Self {
                 idempotency_key: op.idempotency_key,
+                accounts_in_scope,
                 entries: preprocessed_entries,
             })
         }
@@ -173,7 +174,8 @@ impl Acceptor {
         let mut processed_entries = Vec::with_capacity(entries.len());
         let mut totals = HashMap::new();
         for entry in entries {
-            // TODO: identify book_id, target_page, target_lin
+            // TODO: identify book_id, target_page, target_line
+            // TODO: load books using operations.accounts_in_scope book references
             let target_book_id = 0;
             let target_page = 0;
             let target_line = 0;
