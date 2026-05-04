@@ -128,32 +128,18 @@ impl ValidOperation {
 
 #[derive(Debug, Error)]
 pub enum InvalidOperationError {
+    #[error("account not found")]
     AccountNotFound,
+    #[error("entry with zero amount is not allowed")]
     ZeroAmountEntry,
+    #[error("entries are not DR/CR balanced")]
     NonZeroSumEntries,
+    #[error("ledger code must be 8-character ASCII")]
     LedgerCodeInvalid,
+    #[error("book not found")]
     BookNotFound,
 }
 
-impl Display for InvalidOperationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        //TODO better error info
-        f.write_str("Invalid operation structure")
-    }
-}
-
-impl From<mpsc::error::SendError<WriterBuffer>> for OperationError {
-    fn from(_: mpsc::error::SendError<WriterBuffer>) -> Self {
-        //TODO propagate better context?
-        OperationError::WriterSystemFailure
-    }
-}
-impl From<oneshot::error::RecvError> for OperationError {
-    fn from(_: oneshot::error::RecvError) -> Self {
-        //TODO propagate better context?
-        OperationError::AcceptorSystemFailure
-    }
-}
 struct Writer {
     //TODO make these private and instead create a constructor
     rx: mpsc::Receiver<WriterBuffer>,
@@ -252,7 +238,7 @@ impl Acceptor {
                     in_flight.abort()
                 }
                 for pending in self.buffer.drain(..) {
-                    pending.abort(OperationError::WriterSystemFailure)
+                    pending.abort(OperationError::AbortedFromFailedFlush)
                 }
             }
         }
@@ -303,23 +289,12 @@ impl Acceptor {
 }
 #[derive(Debug, Error)]
 pub enum OperationError {
+    #[error("acceptor is no longer running")]
     AcceptorSystemFailure,
-    WriterSystemFailure,
-}
-
-impl From<mpsc::error::SendError<AcceptorCommand>> for OperationError {
-    fn from(_: mpsc::error::SendError<AcceptorCommand>) -> Self {
-        //TODO propagate better context?
-        OperationError::AcceptorSystemFailure
-    }
-}
-impl Display for OperationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OperationError::AcceptorSystemFailure => f.write_str("acceptor is no longer running"),
-            OperationError::WriterSystemFailure => f.write_str("writer is no longer running"),
-        }
-    }
+    #[error("operation aborted due to failed flush")]
+    AbortedFromFailedFlush,
+    #[error("acceptor dropped response channel")]
+    Recv(#[from] oneshot::error::RecvError),
 }
 
 #[derive(Debug)]
@@ -332,7 +307,7 @@ impl AcceptorCommand {
     fn abort(self) {
         let _ = self
             .response_tx
-            .send(Err(OperationError::WriterSystemFailure));
+            .send(Err(OperationError::AbortedFromFailedFlush));
     }
 }
 
@@ -350,7 +325,8 @@ impl AcceptorHandle {
                 operations: op,
                 response_tx: response_sender,
             })
-            .await?;
+            .await
+            .map_err(|_| OperationError::AcceptorSystemFailure)?;
         response_receiver.await?
     }
 }
