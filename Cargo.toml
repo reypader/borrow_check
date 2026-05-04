@@ -9,3 +9,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = "1.52.1"
 uuid = { version = "1.23.1", features = ["serde"] }
+zerocopy = { version = "0.8.48", features = ["derive"] }

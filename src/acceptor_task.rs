@@ -1,8 +1,6 @@
 use crate::{Account, AccountId, BalanceType, BookId, Currency, Operation};
-use std::array::TryFromSliceError;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::io::{Cursor, Write};
 use std::mem::replace;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -10,6 +8,8 @@ use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
+use zerocopy::byteorder::little_endian::{I128, U16, U32, U64, U128};
+use zerocopy::{Immutable, IntoBytes};
 
 pub fn spawn(
     buffer_capacity: usize,
@@ -46,89 +46,27 @@ struct PreProcessedEntry {
     balance_type: BalanceType,
 }
 
-#[derive(Debug)]
-struct ProcessedOperation {
-    idempotency_key: Uuid,
-    entries: Vec<ProcessedEntry>,
-    operation_id: u64,
-    checksum: u32,
+#[derive(IntoBytes, Immutable, Debug)]
+#[repr(C)]
+struct HeaderRecord {
+    record_length: U16,
+    entry_count: u8,
+    operation_id: U64,
+    timestamp_ns: U128,
+    idempotency_key: [u8; 16],
+    checksum: U32,
     prev_hash: [u8; 32],
+    _pad: u8,
 }
 
-#[derive(Debug)]
-struct ProcessedEntry {
-    target_book_id: BookId,
-    amount: i128,
+#[derive(IntoBytes, Immutable, Debug)]
+#[repr(C)]
+struct EntryRecord {
+    target_book_id: U64,
+    target_page: U32,
+    target_line: U16,
+    amount: I128,
     ledger_code: [u8; 8],
-    target_page: u32,
-    target_line: u16,
-}
-
-impl ProcessedOperation {
-    fn compacted(self) -> Result<Vec<u8>, WriteMismatchError> {
-        let ProcessedOperation {
-            idempotency_key,
-            entries,
-            checksum,
-            prev_hash,
-            operation_id,
-        } = self;
-        let record_length = 80 + (38 * entries.len());
-        let mut result = Vec::with_capacity(record_length);
-        let header = {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_nanos();
-            let entry_count = entries.len() as u8; //safe, we'll be limiting the length at the entry point.
-            let mut byte_array = [0u8; 80];
-            let mut write_cursor = Cursor::new(&mut byte_array[..]);
-            write_cursor.write_all(&(record_length as u16).to_le_bytes())?; //2
-            write_cursor.write_all(&entry_count.to_le_bytes())?; //1
-            write_cursor.write_all(&operation_id.to_le_bytes())?; //8
-            write_cursor.write_all(&now.to_le_bytes())?; //16
-            write_cursor.write_all(idempotency_key.as_bytes())?; //16
-            write_cursor.write_all(&checksum.to_le_bytes())?; //4
-            write_cursor.write_all(&prev_hash)?; //32
-            write_cursor.write_all(&0u8.to_le_bytes())?; //8
-
-            let is_filled = write_cursor.position() as usize == write_cursor.get_ref().len();
-            if !is_filled {
-                return Err(WriteMismatchError);
-            } else {
-                byte_array
-            }
-        };
-        result.extend(header);
-
-        for e in entries {
-            let write_entry = {
-                let ProcessedEntry {
-                    target_book_id,
-                    amount,
-                    ledger_code,
-                    target_page,
-                    target_line,
-                } = e;
-                let mut byte_array = [0u8; 38];
-                let mut write_cursor = Cursor::new(&mut byte_array[..]);
-                write_cursor.write_all(&target_book_id.to_le_bytes())?; //8
-                write_cursor.write_all(&target_page.to_le_bytes())?; //4
-                write_cursor.write_all(&target_line.to_le_bytes())?; //2
-                write_cursor.write_all(&amount.to_le_bytes())?; //16
-                write_cursor.write_all(&ledger_code)?; //8
-
-                let is_filled = write_cursor.position() as usize == write_cursor.get_ref().len();
-                if !is_filled {
-                    return Err(WriteMismatchError);
-                } else {
-                    byte_array
-                }
-            };
-            result.extend(write_entry);
-        }
-        Ok(result)
-    }
 }
 
 impl ValidOperation {
@@ -139,50 +77,46 @@ impl ValidOperation {
         let mut totals = HashMap::new();
         let mut preprocessed_entries = Vec::with_capacity(op.entries.len());
         for entry in op.entries {
+            let account = accounts_in_scope
+                .get(&entry.account)
+                .ok_or(InvalidOperationError::AccountNotFound)?;
+
+            let target_book = account
+                .books
+                .get(&(entry.currency, entry.balance_type))
+                .ok_or(InvalidOperationError::BookNotFound)?;
+
             if entry.amount == 0 {
-                return Err(InvalidOperationError::InvariantViolation);
+                return Err(InvalidOperationError::ZeroAmountEntry);
             }
 
-            if entry.ledger_code.len() > 8 {
-                return Err(InvalidOperationError::InvariantViolation);
+            if !entry.ledger_code.is_ascii() || entry.ledger_code.len() > 8 {
+                return Err(InvalidOperationError::LedgerCodeInvalid);
             }
-            let ledger_code = format!("{: >8}", entry.ledger_code)
-                .into_bytes()
-                .as_slice()
-                .try_into()?;
 
-            let account = accounts_in_scope.get(&entry.account);
+            let mut ledger_code = [b' '; 8];
+            let src = entry.ledger_code.as_bytes();
+            ledger_code[8 - src.len()..].copy_from_slice(src);
 
-            match account {
-                Some(account) => {
-                    let entry_amount = if account.account_type != entry.op_type {
-                        -entry.amount
-                    } else {
-                        entry.amount
-                    };
-                    let target_book = account.books.get(&(entry.currency, entry.balance_type));
+            let entry_amount = if account.account_type != entry.op_type {
+                -entry.amount
+            } else {
+                entry.amount
+            };
+            let currency_total = totals.entry(entry.currency).or_insert(0);
+            *currency_total += entry_amount;
 
-                    match target_book {
-                        Some(target_book_id) => {
-                            preprocessed_entries.push(PreProcessedEntry {
-                                target_account_id: entry.account,
-                                target_book_id: *target_book_id,
-                                amount: entry_amount,
-                                ledger_code,
-                                currency: entry.currency,
-                                balance_type: entry.balance_type,
-                            });
-                        }
-                        None => return Err(InvalidOperationError::BookNotFound),
-                    }
-                    let currency_total = totals.entry(entry.currency).or_insert(0);
-                    *currency_total += entry_amount;
-                }
-                None => todo!(),
-            }
+            preprocessed_entries.push(PreProcessedEntry {
+                target_account_id: entry.account,
+                target_book_id: *target_book,
+                amount: entry_amount,
+                ledger_code,
+                currency: entry.currency,
+                balance_type: entry.balance_type,
+            });
         }
         if totals.iter().any(|(_, total)| *total != 0) {
-            Err(InvalidOperationError::InvariantViolation)
+            Err(InvalidOperationError::NonZeroSumEntries)
         } else {
             Ok(Self {
                 idempotency_key: op.idempotency_key,
@@ -193,24 +127,11 @@ impl ValidOperation {
 }
 
 #[derive(Debug, Error)]
-pub struct WriteMismatchError;
-
-impl From<std::io::Error> for WriteMismatchError {
-    fn from(e: std::io::Error) -> Self {
-        println!("Error while compacting {}", e);
-        WriteMismatchError
-    }
-}
-
-impl Display for WriteMismatchError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        //TODO better error info
-        f.write_str("Data size didn't match target serialization format")
-    }
-}
-#[derive(Debug, Error)]
 pub enum InvalidOperationError {
-    InvariantViolation,
+    AccountNotFound,
+    ZeroAmountEntry,
+    NonZeroSumEntries,
+    LedgerCodeInvalid,
     BookNotFound,
 }
 
@@ -218,12 +139,6 @@ impl Display for InvalidOperationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         //TODO better error info
         f.write_str("Invalid operation structure")
-    }
-}
-
-impl From<TryFromSliceError> for InvalidOperationError {
-    fn from(_: TryFromSliceError) -> Self {
-        InvalidOperationError::InvariantViolation
     }
 }
 
@@ -246,14 +161,9 @@ struct Writer {
 
 impl Writer {
     async fn writer_task(mut self) {
-        loop {
-            tokio::select! {
-                Some(mut write_buffer) = self.rx.recv() => {
-                    //TODO actually write to file
-                    for pending in write_buffer.drain(..) {
-                        pending.ack()
-                    }
-                }
+        while let Some(mut write_buffer) = self.rx.recv().await {
+            for pending in write_buffer.drain(..) {
+                pending.ack();
             }
         }
     }
@@ -274,50 +184,61 @@ impl Acceptor {
             response_tx,
         } = cmd;
         let entries = &operations.entries;
-        let mut processed_entries = Vec::with_capacity(entries.capacity());
-        let totals = entries.iter().fold(HashMap::new(), |mut t, entry| {
+        let mut processed_entries = Vec::with_capacity(entries.len());
+        let mut totals = HashMap::new();
+        for entry in entries {
             // TODO: identify book_id, target_page, target_lin
-            processed_entries.push(ProcessedEntry {
-                target_book_id: 0u64,
-                amount: entry.amount,
-                ledger_code: [0; 8],
-                target_page: 0u32,
-                target_line: 0u16,
+            let target_book_id = 0;
+            let target_page = 0;
+            let target_line = 0;
+
+            processed_entries.push(EntryRecord {
+                target_book_id: target_book_id.into(),
+                target_page: target_page.into(),
+                target_line: target_line.into(),
+                amount: entry.amount.into(),
+                ledger_code: entry.ledger_code,
             });
-            let running_total = t.entry(entry.target_account_id).or_insert((
+            let running_total = totals.entry(entry.target_account_id).or_insert((
                 entry.currency,
                 entry.balance_type,
                 0i128,
             ));
             running_total.2 += entry.amount;
-            t
-        });
+        }
 
         //TODO re-validate balances against totals then send OperationResult::Rejected
+        let ending_balances = totals;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let entry_count = entries.len() as u8; //safe, we'll be limiting the length at the entry point.
+        let record_length = 80 + (38 * entries.len()) as u16;
 
         // TODO: identify checksum, prev_hash, operation_id
-        let processed = ProcessedOperation {
-            idempotency_key: operations.idempotency_key,
-            entries: processed_entries,
-            operation_id: 0u64,
-            checksum: 0u32,
-            prev_hash: [0; 32],
+        let operation_id = 0;
+        let checksum = 0;
+        let prev_hash = [0; 32];
+
+        let header = HeaderRecord {
+            record_length: record_length.into(),
+            entry_count: entry_count,
+            operation_id: operation_id.into(),
+            timestamp_ns: now.into(),
+            idempotency_key: operations.idempotency_key.into_bytes(),
+            checksum: checksum.into(),
+            prev_hash,
+            _pad: 0,
         };
 
-        let compaction_result = processed.compacted();
-        match compaction_result {
-            Ok(content) => {
-                self.buffer.push(WriteCommand {
-                    content,
-                    ending_balances: totals, //TODO replace with computed ending balance
-                    response_tx,
-                });
-            }
-            Err(_) => {
-                println!("WriteMismatch");
-                let _ = response_tx.send(Err(OperationError::WriterSystemFailure));
-            }
-        }
+        self.buffer.push(WriteCommand {
+            header,
+            entries: processed_entries,
+            ending_balances,
+            response_tx,
+        });
     }
 
     async fn flush(&mut self) {
@@ -374,6 +295,8 @@ impl Acceptor {
                     }
                     break;
                 }
+
+                else => break,
             }
         }
     }
@@ -442,7 +365,8 @@ pub enum OperationResult {
 
 #[derive(Debug)]
 struct WriteCommand {
-    content: Vec<u8>,
+    header: HeaderRecord,
+    entries: Vec<EntryRecord>,
     ending_balances: HashMap<AccountId, (Currency, BalanceType, i128)>,
     response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
 }

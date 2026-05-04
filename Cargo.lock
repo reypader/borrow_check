@@ -86,6 +86,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "zerocopy",
 ]
 
 [[package]]

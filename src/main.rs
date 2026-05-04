@@ -18,8 +18,8 @@ type BookId = u64;
 type Currency = u16;
 #[derive(Deserialize, Serialize, Copy, Clone, Debug, Eq, PartialEq)]
 enum AccountType {
-    DEBIT,
-    CREDIT,
+    Debit,
+    Credit,
 }
 
 #[derive(Deserialize, Serialize, Eq, Hash, PartialEq, Copy, Clone, Debug)]
@@ -93,7 +93,7 @@ async fn post_operations(
         (
             1,
             Account {
-                account_type: AccountType::CREDIT,
+                account_type: AccountType::Credit,
                 books: HashMap::from([
                     ((123, BalanceType::Available), 1),
                     ((123, BalanceType::Current), 2),
@@ -104,7 +104,7 @@ async fn post_operations(
         (
             2,
             Account {
-                account_type: AccountType::CREDIT,
+                account_type: AccountType::Credit,
                 books: HashMap::from([
                     ((123, BalanceType::Available), 1),
                     ((123, BalanceType::Current), 2),
