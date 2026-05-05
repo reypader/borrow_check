@@ -52,11 +52,10 @@ struct HeaderRecord {
     record_length: U16,
     entry_count: u8,
     operation_id: U64,
-    timestamp_ns: U128,
+    timestamp_ns: U64,
     idempotency_key: [u8; 16],
     checksum: U32,
-    prev_hash: [u8; 32],
-    _pad: u8,
+    prev_hash: [u8; 32]
 }
 
 #[derive(IntoBytes, Immutable, Debug)]
@@ -74,6 +73,11 @@ impl ValidOperation {
         op: Operation,
         accounts_in_scope: HashMap<AccountId, Account>,
     ) -> Result<Self, InvalidOperationError> {
+        //TODO make 100 configurable
+        if op.entries.len() > 100 {
+            return Err(InvalidOperationError::TooManyEntries);
+        }
+
         let mut totals = HashMap::new();
         let mut preprocessed_entries = Vec::with_capacity(op.entries.len());
         for entry in op.entries {
@@ -129,6 +133,8 @@ impl ValidOperation {
 
 #[derive(Debug, Error)]
 pub enum InvalidOperationError {
+    #[error("too many entries in request")]
+    TooManyEntries,
     #[error("account not found")]
     AccountNotFound,
     #[error("entry with zero amount is not allowed")]
@@ -198,10 +204,12 @@ impl Acceptor {
         //TODO re-validate balances against totals then send OperationResult::Rejected
         let ending_balances = totals;
 
-        let now = SystemTime::now()
+        let nanos_u128: u128 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .expect("system clock before 1970")
             .as_nanos();
+        let nanos: u64 = u64::try_from(nanos_u128).expect("timestamp past year 2554");
+
         let entry_count = entries.len() as u8; //safe, we'll be limiting the length at the entry point.
         let record_length = 80 + (38 * entries.len()) as u16;
 
@@ -214,11 +222,10 @@ impl Acceptor {
             record_length: record_length.into(),
             entry_count: entry_count,
             operation_id: operation_id.into(),
-            timestamp_ns: now.into(),
+            timestamp_ns: nanos.into(),
             idempotency_key: operations.idempotency_key.into_bytes(),
             checksum: checksum.into(),
-            prev_hash,
-            _pad: 0,
+            prev_hash
         };
 
         self.buffer.push(WriteCommand {
@@ -234,12 +241,12 @@ impl Acceptor {
         let buffer_to_flush = replace(&mut self.buffer, Vec::with_capacity(buffer_size));
         match self.writer_tx.send(buffer_to_flush).await {
             Ok(_) => (),
-            Err(_) => {
+            Err(mpsc::error::SendError(mut failed_commands)) => {
                 self.rx.close();
                 while let Some(in_flight) = self.rx.recv().await {
                     in_flight.abort()
                 }
-                for pending in self.buffer.drain(..) {
+                for pending in failed_commands.drain(..) {
                     pending.abort(OperationError::AbortedFromFailedFlush)
                 }
             }
