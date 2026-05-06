@@ -16,8 +16,25 @@ pub fn spawn(
     manual_flush_after: Duration,
 ) -> AcceptorHandle {
     let (writer_tx, writer_rx) = mpsc::channel(channel_capacity);
-    let writer = Writer { rx: writer_rx };
-    tokio::spawn(writer.writer_task());
+
+    //TODO pre-load cover from disk
+    let cover = JournalCoverBytes {
+        checkpoint_page: 0u32.into(),
+        checkpoint_line: 0u16.into(),
+        latest_page: 0u32.into(),
+        latest_line: 0u16.into(),
+        local_floor_page: 0u32.into(),
+        tip_operation_id: 0u64.into(),
+        tip_hash: [0; 32],
+    };
+
+    //TODO start pointing to current page then fill with zeros then point to the next page
+
+    let writer = JournalWriter {
+        rx: writer_rx,
+        cover
+    };
+    tokio::spawn(writer.journal_writer_task());
 
     let (acceptor_tx, acceptor_rx) = mpsc::channel(channel_capacity);
     let acceptor = Acceptor {
@@ -48,19 +65,31 @@ struct PreProcessedEntry {
 
 #[derive(IntoBytes, Immutable, Debug)]
 #[repr(C)]
-struct HeaderRecord {
+struct JournalCoverBytes {
+    checkpoint_page: U32,
+    checkpoint_line: U16,
+    latest_page: U32,
+    latest_line: U16,
+    local_floor_page: U32,
+    tip_operation_id: U64,
+    tip_hash: [u8; 32],
+}
+
+#[derive(IntoBytes, Immutable, Debug)]
+#[repr(C)]
+struct JournalHeaderBytes {
     record_length: U16,
     entry_count: u8,
     operation_id: U64,
     timestamp_ns: U64,
     idempotency_key: [u8; 16],
     checksum: U32,
-    prev_hash: [u8; 32]
+    prev_hash: [u8; 32],
 }
 
 #[derive(IntoBytes, Immutable, Debug)]
 #[repr(C)]
-struct EntryRecord {
+struct JournalEntryBytes {
     target_book_id: U64,
     target_page: U32,
     target_line: U16,
@@ -147,15 +176,24 @@ pub enum InvalidOperationError {
     BookNotFound,
 }
 
-struct Writer {
+struct JournalWriter {
     //TODO make these private and instead create a constructor
     rx: mpsc::Receiver<WriterBuffer>,
+    cover: JournalCoverBytes,
 }
 
-impl Writer {
-    async fn writer_task(mut self) {
+impl JournalWriter {
+    async fn journal_writer_task(mut self) {
+        //destructure JournalCoverBytes
         while let Some(mut write_buffer) = self.rx.recv().await {
             for pending in write_buffer.drain(..) {
+                // check if current record would fit the current page
+                // if not fill the page with 0s then repoint to the next page and write the header with the starting offset
+
+                // start writing again.
+
+                
+
                 pending.ack();
             }
         }
@@ -186,7 +224,7 @@ impl Acceptor {
             let target_page = 0;
             let target_line = 0;
 
-            processed_entries.push(EntryRecord {
+            processed_entries.push(JournalEntryBytes {
                 target_book_id: target_book_id.into(),
                 target_page: target_page.into(),
                 target_line: target_line.into(),
@@ -210,22 +248,25 @@ impl Acceptor {
             .as_nanos();
         let nanos: u64 = u64::try_from(nanos_u128).expect("timestamp past year 2554");
 
-        let entry_count = entries.len() as u8; //safe, we'll be limiting the length at the entry point.
-        let record_length = 80 + (38 * entries.len()) as u16;
+        let entry_count = u8::try_from(entries.len()).expect("entries exceeded 255"); //safe, we'll be limiting the length at the entry point.
+        let record_length = u16::try_from(
+            size_of::<JournalHeaderBytes>() + (size_of::<JournalEntryBytes>() * entries.len()),
+        )
+        .expect("record length exceeded 65535");
 
         // TODO: identify checksum, prev_hash, operation_id
         let operation_id = 0;
         let checksum = 0;
         let prev_hash = [0; 32];
 
-        let header = HeaderRecord {
+        let header = JournalHeaderBytes {
             record_length: record_length.into(),
             entry_count: entry_count,
             operation_id: operation_id.into(),
             timestamp_ns: nanos.into(),
             idempotency_key: operations.idempotency_key.into_bytes(),
             checksum: checksum.into(),
-            prev_hash
+            prev_hash,
         };
 
         self.buffer.push(WriteCommand {
@@ -350,8 +391,8 @@ pub enum OperationResult {
 
 #[derive(Debug)]
 struct WriteCommand {
-    header: HeaderRecord,
-    entries: Vec<EntryRecord>,
+    header: JournalHeaderBytes,
+    entries: Vec<JournalEntryBytes>,
     ending_balances: HashMap<AccountId, (Currency, BalanceType, i128)>,
     response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
 }
