@@ -32,7 +32,7 @@ pub fn spawn(
 
     let writer = JournalWriter {
         rx: writer_rx,
-        cover
+        cover,
     };
     tokio::spawn(writer.journal_writer_task());
 
@@ -131,13 +131,20 @@ impl ValidOperation {
             let src = entry.ledger_code.as_bytes();
             ledger_code[8 - src.len()..].copy_from_slice(src);
 
+            let currency_total = totals.entry(entry.currency).or_insert(0);
+            
+            // account nature agnostic zero-sum check
+            *currency_total += match entry.op_type {
+                crate::AccountType::Debit => -entry.amount,
+                crate::AccountType::Credit => entry.amount,
+            };
+
+            // persisted amount sign flip
             let entry_amount = if account.account_type != entry.op_type {
                 -entry.amount
             } else {
                 entry.amount
             };
-            let currency_total = totals.entry(entry.currency).or_insert(0);
-            *currency_total += entry_amount;
 
             preprocessed_entries.push(PreProcessedEntry {
                 target_account_id: entry.account,
@@ -191,8 +198,6 @@ impl JournalWriter {
                 // if not fill the page with 0s then repoint to the next page and write the header with the starting offset
 
                 // start writing again.
-
-                
 
                 pending.ack();
             }
