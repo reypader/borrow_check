@@ -1,4 +1,11 @@
-use crate::{Account, AccountId, BalanceType, BookId, Currency, Operation};
+use crate::accounts::AccountId;
+use crate::books::BalanceType;
+use crate::currency::Currency;
+use crate::journal::{
+    JournalCoverBytes, JournalEntryBytes, JournalHeaderBytes, JournalWriter, WriteCommand,
+    WriterBuffer,
+};
+use crate::operation::ValidOperation;
 use std::collections::HashMap;
 use std::mem::replace;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,11 +13,8 @@ use thiserror::Error;
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep};
-use uuid::Uuid;
-use zerocopy::byteorder::little_endian::{I128, U16, U32, U64, U128};
-use zerocopy::{Immutable, IntoBytes};
 
-pub fn spawn(
+pub(crate) fn spawn(
     buffer_capacity: usize,
     channel_capacity: usize,
     manual_flush_after: Duration,
@@ -46,166 +50,6 @@ pub fn spawn(
     AcceptorHandle { tx: acceptor_tx }
 }
 
-#[derive(Debug)]
-pub struct ValidOperation {
-    idempotency_key: Uuid,
-    accounts_in_scope: HashMap<AccountId, Account>,
-    entries: Vec<PreProcessedEntry>,
-}
-
-#[derive(Debug)]
-struct PreProcessedEntry {
-    target_account_id: AccountId,
-    target_book_id: BookId,
-    amount: i128,
-    ledger_code: [u8; 8],
-    currency: Currency,
-    balance_type: BalanceType,
-}
-
-#[derive(IntoBytes, Immutable, Debug)]
-#[repr(C)]
-struct JournalCoverBytes {
-    checkpoint_page: U32,
-    checkpoint_line: U16,
-    latest_page: U32,
-    latest_line: U16,
-    local_floor_page: U32,
-    tip_operation_id: U64,
-    tip_hash: [u8; 32],
-}
-
-#[derive(IntoBytes, Immutable, Debug)]
-#[repr(C)]
-struct JournalHeaderBytes {
-    record_length: U16,
-    entry_count: u8,
-    operation_id: U64,
-    timestamp_ns: U64,
-    idempotency_key: [u8; 16],
-    checksum: U32,
-    prev_hash: [u8; 32],
-}
-
-#[derive(IntoBytes, Immutable, Debug)]
-#[repr(C)]
-struct JournalEntryBytes {
-    target_book_id: U64,
-    target_page: U32,
-    target_line: U16,
-    amount: I128,
-    ledger_code: [u8; 8],
-}
-
-impl ValidOperation {
-    pub fn parse(
-        op: Operation,
-        accounts_in_scope: HashMap<AccountId, Account>,
-    ) -> Result<Self, InvalidOperationError> {
-        //TODO make 100 configurable
-        if op.entries.len() > 100 {
-            return Err(InvalidOperationError::TooManyEntries);
-        }
-
-        let mut totals = HashMap::new();
-        let mut preprocessed_entries = Vec::with_capacity(op.entries.len());
-        for entry in op.entries {
-            let account = accounts_in_scope
-                .get(&entry.account)
-                .ok_or(InvalidOperationError::AccountNotFound)?;
-
-            let target_book = account
-                .books
-                .get(&(entry.currency, entry.balance_type))
-                .ok_or(InvalidOperationError::BookNotFound)?;
-
-            if entry.amount == 0 {
-                return Err(InvalidOperationError::ZeroAmountEntry);
-            }
-
-            if !entry.ledger_code.is_ascii() || entry.ledger_code.len() > 8 {
-                return Err(InvalidOperationError::LedgerCodeInvalid);
-            }
-
-            let mut ledger_code = [b' '; 8];
-            let src = entry.ledger_code.as_bytes();
-            ledger_code[8 - src.len()..].copy_from_slice(src);
-
-            let currency_total = totals.entry(entry.currency).or_insert(0);
-            
-            // account nature agnostic zero-sum check
-            *currency_total += match entry.op_type {
-                crate::AccountType::Debit => -entry.amount,
-                crate::AccountType::Credit => entry.amount,
-            };
-
-            // persisted amount sign flip
-            let entry_amount = if account.account_type != entry.op_type {
-                -entry.amount
-            } else {
-                entry.amount
-            };
-
-            preprocessed_entries.push(PreProcessedEntry {
-                target_account_id: entry.account,
-                target_book_id: *target_book,
-                amount: entry_amount,
-                ledger_code,
-                currency: entry.currency,
-                balance_type: entry.balance_type,
-            });
-        }
-        if totals.iter().any(|(_, total)| *total != 0) {
-            Err(InvalidOperationError::NonZeroSumEntries)
-        } else {
-            Ok(Self {
-                idempotency_key: op.idempotency_key,
-                accounts_in_scope,
-                entries: preprocessed_entries,
-            })
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum InvalidOperationError {
-    #[error("too many entries in request")]
-    TooManyEntries,
-    #[error("account not found")]
-    AccountNotFound,
-    #[error("entry with zero amount is not allowed")]
-    ZeroAmountEntry,
-    #[error("entries are not DR/CR balanced")]
-    NonZeroSumEntries,
-    #[error("ledger code must be 8-character ASCII")]
-    LedgerCodeInvalid,
-    #[error("book not found")]
-    BookNotFound,
-}
-
-struct JournalWriter {
-    //TODO make these private and instead create a constructor
-    rx: mpsc::Receiver<WriterBuffer>,
-    cover: JournalCoverBytes,
-}
-
-impl JournalWriter {
-    async fn journal_writer_task(mut self) {
-        //destructure JournalCoverBytes
-        while let Some(mut write_buffer) = self.rx.recv().await {
-            for pending in write_buffer.drain(..) {
-                // check if current record would fit the current page
-                // if not fill the page with 0s then repoint to the next page and write the header with the starting offset
-
-                // start writing again.
-
-                pending.ack();
-            }
-        }
-    }
-}
-
-type WriterBuffer = Vec<WriteCommand>;
 struct Acceptor {
     //TODO make these private and instead create a constructor
     buffer: WriterBuffer,
@@ -342,8 +186,9 @@ impl Acceptor {
         }
     }
 }
+
 #[derive(Debug, Error)]
-pub enum OperationError {
+pub(crate) enum OperationError {
     #[error("acceptor is no longer running")]
     AcceptorSystemFailure,
     #[error("operation aborted due to failed flush")]
@@ -367,13 +212,16 @@ impl AcceptorCommand {
 }
 
 #[derive(Clone)]
-pub struct AcceptorHandle {
+pub(crate) struct AcceptorHandle {
     //TODO make these private and instead create a constructor
     tx: mpsc::Sender<AcceptorCommand>,
 }
 
 impl AcceptorHandle {
-    pub async fn submit(&self, op: ValidOperation) -> Result<OperationResult, OperationError> {
+    pub(crate) async fn submit(
+        &self,
+        op: ValidOperation,
+    ) -> Result<OperationResult, OperationError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.tx
             .send(AcceptorCommand {
@@ -385,31 +233,12 @@ impl AcceptorHandle {
         response_receiver.await?
     }
 }
+
 #[derive(Debug)]
-pub enum OperationResult {
+pub(crate) enum OperationResult {
     /// Contains the resulting balances after the accepted operation
     Accepted(HashMap<AccountId, (Currency, BalanceType, i128)>),
 
     /// Contains the AccountId whose balance caused the rejection
     Rejected(AccountId),
-}
-
-#[derive(Debug)]
-struct WriteCommand {
-    header: JournalHeaderBytes,
-    entries: Vec<JournalEntryBytes>,
-    ending_balances: HashMap<AccountId, (Currency, BalanceType, i128)>,
-    response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
-}
-
-impl WriteCommand {
-    fn abort(self, reason: OperationError) {
-        let _ = self.response_tx.send(Err(reason));
-    }
-
-    fn ack(self) {
-        let _ = self
-            .response_tx
-            .send(Ok(OperationResult::Accepted(self.ending_balances)));
-    }
 }
