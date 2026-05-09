@@ -1,5 +1,5 @@
-use crate::accounts::AccountId;
 use crate::acceptor::{OperationError, OperationResult};
+use crate::accounts::AccountId;
 use crate::books::BalanceType;
 use crate::currency::Currency;
 use std::collections::HashMap;
@@ -79,8 +79,7 @@ impl WriteCommand {
     }
 
     fn ack(self) {
-        let _ = self
-            .response_tx
+        let _ = self.response_tx
             .send(Ok(OperationResult::Accepted(self.ending_balances)));
     }
 }

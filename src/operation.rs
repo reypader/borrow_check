@@ -1,20 +1,22 @@
-use crate::accounts::{Account, AccountId, AccountType};
+use crate::accounts::{AccountId, AccountState, AccountType};
 use crate::books::{BalanceType, BookId};
 use crate::currency::Currency;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 #[derive(Deserialize, Debug)]
 pub(crate) struct Operation {
     idempotency_key: Uuid,
-    entries: Vec<OperationEntry>,
+    pub(crate) entries: Vec<OperationEntry>,
 }
 
 #[derive(Deserialize, Debug)]
-struct OperationEntry {
-    account: AccountId,
+pub(crate) struct OperationEntry {
+    pub(crate) account: AccountId,
     balance_type: BalanceType,
     op_type: AccountType,
     amount: i128,
@@ -25,7 +27,7 @@ struct OperationEntry {
 #[derive(Debug)]
 pub(crate) struct ValidOperation {
     pub(crate) idempotency_key: Uuid,
-    accounts_in_scope: HashMap<AccountId, Account>,
+    accounts_in_scope: HashMap<AccountId, Arc<RwLock<AccountState>>>,
     pub(crate) entries: Vec<PreProcessedEntry>,
 }
 
@@ -40,9 +42,9 @@ pub(crate) struct PreProcessedEntry {
 }
 
 impl ValidOperation {
-    pub(crate) fn parse(
+    pub(crate) async fn parse(
         op: Operation,
-        accounts_in_scope: HashMap<AccountId, Account>,
+        accounts_in_scope: HashMap<AccountId, Arc<RwLock<AccountState>>>,
     ) -> Result<Self, InvalidOperationError> {
         //TODO make 100 configurable
         if op.entries.len() > 100 {
@@ -54,7 +56,9 @@ impl ValidOperation {
         for entry in op.entries {
             let account = accounts_in_scope
                 .get(&entry.account)
-                .ok_or(InvalidOperationError::AccountNotFound)?;
+                .ok_or(InvalidOperationError::AccountNotFound)?
+                .read()
+                .await;
 
             let target_book = account
                 .books

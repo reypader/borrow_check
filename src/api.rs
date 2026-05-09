@@ -1,6 +1,6 @@
-use crate::accounts::{Account, AccountType};
-use crate::acceptor::AcceptorHandle;
 use crate::acceptor::OperationResult::{Accepted, Rejected};
+use crate::acceptor::SystemHandles;
+use crate::accounts::{AccountState, AccountType};
 use crate::books::BalanceType;
 use crate::currency::Currency;
 use crate::operation::{InvalidOperationError, Operation, ValidOperation};
@@ -46,35 +46,14 @@ impl From<InvalidOperationError> for ApiError {
 #[post("/operations", format = "application/json", data = "<operation>")]
 pub(crate) async fn post_operations(
     operation: Json<Operation>,
-    acceptor_handle: &State<AcceptorHandle>, //This shouldn't be
+    system_handle: &State<SystemHandles>, //This shouldn't be
 ) -> Result<Json<OperationResult>, ApiError> {
     //TODO pre-load accounts
-    let loaded_accounts = HashMap::from([
-        (
-            1,
-            Account {
-                account_type: AccountType::Credit,
-                books: HashMap::from([
-                    ((123, BalanceType::Available), 1),
-                    ((123, BalanceType::Current), 2),
-                    ((123, BalanceType::Hold), 3),
-                ]),
-            },
-        ),
-        (
-            2,
-            Account {
-                account_type: AccountType::Credit,
-                books: HashMap::from([
-                    ((123, BalanceType::Available), 1),
-                    ((123, BalanceType::Current), 2),
-                    ((123, BalanceType::Hold), 3),
-                ]),
-            },
-        ),
-    ]);
-    let valid_op = ValidOperation::parse(operation.0, loaded_accounts)?;
-    match acceptor_handle.submit(valid_op).await {
+    let op = operation.0;
+    let ids = op.entries.iter().map(|e| e.account).collect();
+    let loaded_accounts = system_handle.load_accounts(ids).await.unwrap();//TODO wrap in async alongside submit
+    let valid_op = ValidOperation::parse(op, loaded_accounts).await?;
+    match system_handle.submit_operation(valid_op).await {
         Ok(Accepted(balances)) => Ok(Json(OperationResult {
             //TODO refactor this to a better mapping
             resulting_balances: balances
@@ -94,4 +73,3 @@ pub(crate) async fn post_operations(
         Err(x) => Err(SystemError(format!("system error: {:?}", x))),
     }
 }
-

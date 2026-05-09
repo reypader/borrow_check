@@ -1,24 +1,46 @@
-use crate::accounts::AccountId;
-use crate::books::BalanceType;
+use crate::accounts::{
+    AccountId, AccountLoadError, AccountRegistryActor, AccountRegistryCommand, AccountRegistryMap,
+    AccountState,
+};
+use crate::books::{BalanceType, BookRegistryActor, BookRegistryCommand, BookRegistryMap};
 use crate::currency::Currency;
 use crate::journal::{
     JournalCoverBytes, JournalEntryBytes, JournalHeaderBytes, JournalWriter, WriteCommand,
     WriterBuffer,
 };
-use crate::operation::ValidOperation;
+use crate::operation::{Operation, ValidOperation};
 use std::collections::HashMap;
 use std::mem::replace;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::signal;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::{Instant, sleep};
 
 pub(crate) fn spawn(
     buffer_capacity: usize,
     channel_capacity: usize,
     manual_flush_after: Duration,
-) -> AcceptorHandle {
+) -> SystemHandles {
+    let (account_registry_tx, account_registry_rx) = mpsc::channel(channel_capacity);
+
+    let account_registry = AccountRegistryActor {
+        map: AccountRegistryMap::default(),
+        rx: account_registry_rx,
+    };
+
+    tokio::spawn(account_registry.account_registry_task());
+
+    let (book_registry_tx, book_registry_rx) = mpsc::channel(channel_capacity);
+
+    let book_registry = BookRegistryActor {
+        map: BookRegistryMap::default(),
+        rx: book_registry_rx,
+    };
+
+    tokio::spawn(book_registry.book_registry_task());
+
     let (writer_tx, writer_rx) = mpsc::channel(channel_capacity);
 
     //TODO pre-load cover from disk
@@ -45,15 +67,20 @@ pub(crate) fn spawn(
         buffer: Vec::with_capacity(buffer_capacity),
         writer_tx,
         rx: acceptor_rx,
+        book_registry_tx,
     };
     tokio::spawn(acceptor.acceptor_task(manual_flush_after));
-    AcceptorHandle { tx: acceptor_tx }
+    SystemHandles {
+        acceptor_tx,
+        account_tx: account_registry_tx,
+    }
 }
 
 struct Acceptor {
     //TODO make these private and instead create a constructor
     buffer: WriterBuffer,
     writer_tx: mpsc::Sender<WriterBuffer>,
+    book_registry_tx: mpsc::Sender<BookRegistryCommand>,
     rx: mpsc::Receiver<AcceptorCommand>,
 }
 
@@ -64,6 +91,7 @@ impl Acceptor {
             response_tx,
         } = cmd;
         let entries = &operations.entries;
+        let mut ids = Vec::with_capacity(entries.len());
         let mut processed_entries = Vec::with_capacity(entries.len());
         let mut totals = HashMap::new();
         for entry in entries {
@@ -73,6 +101,7 @@ impl Acceptor {
             let target_page = 0;
             let target_line = 0;
 
+            ids.push(entry.target_account_id);
             processed_entries.push(JournalEntryBytes {
                 target_book_id: target_book_id.into(),
                 target_page: target_page.into(),
@@ -88,8 +117,58 @@ impl Acceptor {
             running_total.2 += entry.amount;
         }
 
+        let (registry_tx, registry_rx) = oneshot::channel();
+
+        let load = async {
+            self.book_registry_tx
+                .send(BookRegistryCommand::GetBooks {
+                    ids,
+                    reply: registry_tx,
+                })
+                .await
+                .map_err(|_| OperationError::RegistryFailure)?;
+            registry_rx
+                .await
+                .map_err(|_| OperationError::RegistryFailure)?
+                .map_err(|book_load_error| OperationError::FailedToLoadBook) //TODO propagate book_load_error's info
+        }
+        .await;
+
+        let states = match load {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = response_tx.send(Err(e));
+                return;
+            }
+        };
+
         //TODO re-validate balances against totals then send OperationResult::Rejected
-        let ending_balances = totals;
+        let mut ending_balances = HashMap::with_capacity(totals.len());
+        for (book_id, book_arc) in states {
+            let guard = book_arc.read().await;
+            let total_durable =
+                guard
+                    .durable_pending_rollup
+                    .iter()
+                    .fold(guard.running_balance, |acc, r| {
+                        let val: i128 = r.amount.into();
+                        val + acc
+                    });
+            let merged_balance = guard.pending_journal.iter().fold(total_durable, |acc, r| {
+                let val: i128 = r.amount.into();
+                val + acc
+            });
+            // TODO is there a better way to do this? totals, ids, and states should be guaranteed that they contain the same keys.
+            let (currency, balance_type, incoming_total) = totals.get(&book_id).unwrap();
+            let ending_balance = merged_balance + (*incoming_total);
+            if ending_balance < 0 {
+                response_tx.send(Ok(OperationResult::Rejected(book_id)));
+                return;
+            } else {
+                //TODO this is a bug, should be account id
+                ending_balances.insert(book_id, (*currency, *balance_type, ending_balance));
+            }
+        }
 
         let nanos_u128: u128 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -195,6 +274,10 @@ pub(crate) enum OperationError {
     AbortedFromFailedFlush,
     #[error("acceptor dropped response channel")]
     Recv(#[from] oneshot::error::RecvError),
+    #[error("failed to load books")]
+    FailedToLoadBook,
+    #[error("registry task failure")]
+    RegistryFailure,
 }
 
 #[derive(Debug)]
@@ -212,24 +295,39 @@ impl AcceptorCommand {
 }
 
 #[derive(Clone)]
-pub(crate) struct AcceptorHandle {
-    //TODO make these private and instead create a constructor
-    tx: mpsc::Sender<AcceptorCommand>,
+pub(crate) struct SystemHandles {
+    acceptor_tx: mpsc::Sender<AcceptorCommand>,
+    account_tx: mpsc::Sender<AccountRegistryCommand>,
 }
 
-impl AcceptorHandle {
-    pub(crate) async fn submit(
+impl SystemHandles {
+    pub(crate) async fn submit_operation(
         &self,
         op: ValidOperation,
     ) -> Result<OperationResult, OperationError> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.tx
+        self.acceptor_tx
             .send(AcceptorCommand {
                 operations: op,
                 response_tx: response_sender,
             })
             .await
             .map_err(|_| OperationError::AcceptorSystemFailure)?;
+        response_receiver.await?
+    }
+
+    pub(crate) async fn load_accounts(
+        &self,
+        ids: Vec<u64>,
+    ) -> Result<HashMap<AccountId, Arc<RwLock<AccountState>>>, AccountLoadError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.account_tx
+            .send(AccountRegistryCommand::GetAccounts {
+                ids,
+                reply: response_sender,
+            })
+            .await
+            .map_err(|_| AccountLoadError::AccountNotFound)?;
         response_receiver.await?
     }
 }
