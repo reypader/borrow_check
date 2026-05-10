@@ -1,6 +1,7 @@
 use crate::accounts::{AccountId, AccountState, AccountType};
-use crate::books::{BalanceType, BookId};
+use crate::books::{BalanceType, BookId, BookState, InScopeBook};
 use crate::currency::Currency;
+use crate::journal::{JournalEntryBytes, JournalHeaderBytes};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,32 +28,51 @@ pub(crate) struct OperationEntry {
 #[derive(Debug)]
 pub(crate) struct ValidOperation {
     pub(crate) idempotency_key: Uuid,
-    accounts_in_scope: HashMap<AccountId, Arc<RwLock<AccountState>>>,
-    pub(crate) entries: Vec<PreProcessedEntry>,
+    pub(crate) entries_by_book: HashMap<BookId, Vec<PreProcessedEntry>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PreProcessedEntry {
     pub(crate) target_account_id: AccountId,
-    target_book_id: BookId,
     pub(crate) amount: i128,
     pub(crate) ledger_code: [u8; 8],
     pub(crate) currency: Currency,
     pub(crate) balance_type: BalanceType,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedOperation {
+    pub(crate) idempotency_key: Uuid,
+    pub(crate) total_entry_count: u8,
+    pub(crate) record_length: u16,
+    pub(crate) per_book: Vec<PreparedBook>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedBook {
+    pub(crate) book_id: BookId,
+    pub(crate) account_id: AccountId,
+    pub(crate) currency: Currency,
+    pub(crate) balance_type: BalanceType,
+    pub(crate) allow_overdraft: bool,
+    pub(crate) state: Arc<RwLock<BookState>>,
+    pub(crate) net_delta: i128,
+    pub(crate) entries: Vec<PreProcessedEntry>,
+}
+
 impl ValidOperation {
     pub(crate) async fn parse(
         op: Operation,
-        accounts_in_scope: HashMap<AccountId, Arc<RwLock<AccountState>>>,
+        accounts_in_scope: &HashMap<AccountId, Arc<RwLock<AccountState>>>,
     ) -> Result<Self, InvalidOperationError> {
         //TODO make 100 configurable
         if op.entries.len() > 100 {
             return Err(InvalidOperationError::TooManyEntries);
         }
 
-        let mut totals = HashMap::new();
-        let mut preprocessed_entries = Vec::with_capacity(op.entries.len());
+        let mut totals: HashMap<Currency, i128> = HashMap::new();
+        let mut entries_by_book: HashMap<BookId, Vec<PreProcessedEntry>> =
+            HashMap::with_capacity(op.entries.len());
         for entry in op.entries {
             let account = accounts_in_scope
                 .get(&entry.account)
@@ -92,24 +112,66 @@ impl ValidOperation {
                 entry.amount
             };
 
-            preprocessed_entries.push(PreProcessedEntry {
-                target_account_id: entry.account,
-                target_book_id: *target_book,
-                amount: entry_amount,
-                ledger_code,
-                currency: entry.currency,
-                balance_type: entry.balance_type,
-            });
+            entries_by_book
+                .entry(*target_book)
+                .or_default()
+                .push(PreProcessedEntry {
+                    target_account_id: entry.account,
+                    amount: entry_amount,
+                    ledger_code,
+                    currency: entry.currency,
+                    balance_type: entry.balance_type,
+                });
         }
+
         if totals.iter().any(|(_, total)| *total != 0) {
             Err(InvalidOperationError::NonZeroSumEntries)
         } else {
             Ok(Self {
                 idempotency_key: op.idempotency_key,
-                accounts_in_scope,
-                entries: preprocessed_entries,
+                entries_by_book,
             })
         }
+    }
+
+    pub(crate) fn into_prepared(
+        self,
+        books_in_scope: &HashMap<BookId, InScopeBook>,
+    ) -> Result<PreparedOperation, BookId> {
+        let mut per_book = Vec::with_capacity(self.entries_by_book.len());
+        let mut total_entries: usize = 0;
+
+        for (book_id, group) in self.entries_by_book {
+            let in_scope = books_in_scope.get(&book_id).ok_or(book_id)?;
+
+            let net_delta: i128 = group.iter().map(|e| e.amount).sum();
+            let head = &group[0];
+            total_entries += group.len();
+
+            per_book.push(PreparedBook {
+                book_id,
+                account_id: in_scope.account_id,
+                currency: head.currency,
+                balance_type: head.balance_type,
+                allow_overdraft: in_scope.allow_overdraft,
+                state: in_scope.state.clone(),
+                net_delta,
+                entries: group,
+            });
+        }
+
+        let record_length = u16::try_from(
+            size_of::<JournalHeaderBytes>() + size_of::<JournalEntryBytes>() * total_entries,
+        )
+        .expect("record length exceeded 65535");
+        let total_entry_count = u8::try_from(total_entries).expect("entries exceeded 255");
+
+        Ok(PreparedOperation {
+            idempotency_key: self.idempotency_key,
+            total_entry_count,
+            record_length,
+            per_book,
+        })
     }
 }
 

@@ -2,13 +2,16 @@ use crate::accounts::{
     AccountId, AccountLoadError, AccountRegistryActor, AccountRegistryCommand, AccountRegistryMap,
     AccountState,
 };
-use crate::books::{BalanceType, BookRegistryActor, BookRegistryCommand, BookRegistryMap};
+use crate::books::{
+    BalanceType, BookId, BookLoadError, BookRegistryActor, BookRegistryCommand, BookRegistryMap,
+    BookState,
+};
 use crate::currency::Currency;
 use crate::journal::{
-    JournalCoverBytes, JournalEntryBytes, JournalHeaderBytes, JournalWriter, WriteCommand,
-    WriterBuffer,
+    BookContribution, JournalCoverBytes, JournalEntryBytes, JournalHeaderBytes, JournalWriter,
+    WriteCommand, WriterBuffer,
 };
-use crate::operation::{Operation, ValidOperation};
+use crate::operation::{PreparedBook, PreparedOperation};
 use std::collections::HashMap;
 use std::mem::replace;
 use std::sync::Arc;
@@ -67,12 +70,12 @@ pub(crate) fn spawn(
         buffer: Vec::with_capacity(buffer_capacity),
         writer_tx,
         rx: acceptor_rx,
-        book_registry_tx,
     };
     tokio::spawn(acceptor.acceptor_task(manual_flush_after));
     SystemHandles {
         acceptor_tx,
         account_tx: account_registry_tx,
+        book_tx: book_registry_tx,
     }
 }
 
@@ -80,94 +83,86 @@ struct Acceptor {
     //TODO make these private and instead create a constructor
     buffer: WriterBuffer,
     writer_tx: mpsc::Sender<WriterBuffer>,
-    book_registry_tx: mpsc::Sender<BookRegistryCommand>,
     rx: mpsc::Receiver<AcceptorCommand>,
 }
 
 impl Acceptor {
     async fn handle(&mut self, cmd: AcceptorCommand) {
         let AcceptorCommand {
-            operations,
+            prepared,
             response_tx,
         } = cmd;
-        let entries = &operations.entries;
-        let mut ids = Vec::with_capacity(entries.len());
-        let mut processed_entries = Vec::with_capacity(entries.len());
-        let mut totals = HashMap::new();
-        for entry in entries {
-            // TODO: identify book_id, target_page, target_line
-            // TODO: load books using operations.accounts_in_scope book references
-            let target_book_id = 0;
-            let target_page = 0;
-            let target_line = 0;
+        let PreparedOperation {
+            idempotency_key,
+            total_entry_count,
+            record_length,
+            per_book,
+        } = prepared;
 
-            ids.push(entry.target_account_id);
-            processed_entries.push(JournalEntryBytes {
-                target_book_id: target_book_id.into(),
-                target_page: target_page.into(),
-                target_line: target_line.into(),
-                amount: entry.amount.into(),
-                ledger_code: entry.ledger_code,
-            });
-            let running_total = totals.entry(entry.target_account_id).or_insert((
-                entry.currency,
-                entry.balance_type,
-                0i128,
-            ));
-            running_total.2 += entry.amount;
-        }
+        let mut ending_balances: HashMap<(AccountId, Currency, BalanceType), i128> =
+            HashMap::with_capacity(per_book.len());
 
-        let (registry_tx, registry_rx) = oneshot::channel();
-
-        let load = async {
-            self.book_registry_tx
-                .send(BookRegistryCommand::GetBooks {
-                    ids,
-                    reply: registry_tx,
-                })
-                .await
-                .map_err(|_| OperationError::RegistryFailure)?;
-            registry_rx
-                .await
-                .map_err(|_| OperationError::RegistryFailure)?
-                .map_err(|book_load_error| OperationError::FailedToLoadBook) //TODO propagate book_load_error's info
-        }
-        .await;
-
-        let states = match load {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = response_tx.send(Err(e));
-                return;
-            }
-        };
-
-        //TODO re-validate balances against totals then send OperationResult::Rejected
-        let mut ending_balances = HashMap::with_capacity(totals.len());
-        for (book_id, book_arc) in states {
-            let guard = book_arc.read().await;
-            let total_durable =
+        for book in &per_book {
+            let guard = book.state.read().await;
+            let durable =
                 guard
                     .durable_pending_rollup
                     .iter()
                     .fold(guard.running_balance, |acc, r| {
                         let val: i128 = r.amount.into();
-                        val + acc
+                        acc + val
                     });
-            let merged_balance = guard.pending_journal.iter().fold(total_durable, |acc, r| {
-                let val: i128 = r.amount.into();
-                val + acc
-            });
-            // TODO is there a better way to do this? totals, ids, and states should be guaranteed that they contain the same keys.
-            let (currency, balance_type, incoming_total) = totals.get(&book_id).unwrap();
-            let ending_balance = merged_balance + (*incoming_total);
-            if ending_balance < 0 {
-                response_tx.send(Ok(OperationResult::Rejected(book_id)));
+            let merged = guard
+                .pending_journal
+                .iter()
+                .fold(durable, |acc, &amt| acc + amt);
+            drop(guard);
+
+            let projected = match merged.checked_add(book.net_delta) {
+                Some(v) => v,
+                None => {
+                    let _ = response_tx.send(Ok(OperationResult::Overflow(book.book_id)));
+                    return;
+                }
+            };
+
+            if projected < 0 && !book.allow_overdraft {
+                let _ = response_tx.send(Ok(OperationResult::Rejected(book.account_id)));
                 return;
-            } else {
-                //TODO this is a bug, should be account id
-                ending_balances.insert(book_id, (*currency, *balance_type, ending_balance));
             }
+
+            ending_balances.insert(
+                (book.account_id, book.currency, book.balance_type),
+                projected,
+            );
+        }
+
+        let mut book_contributions: Vec<BookContribution> = Vec::with_capacity(per_book.len());
+        for book in per_book {
+            let PreparedBook {
+                book_id,
+                state,
+                entries,
+                ..
+            } = book;
+            let mut journal_entries: Vec<JournalEntryBytes> = Vec::with_capacity(entries.len());
+            let mut guard = state.write().await;
+            for entry in &entries {
+                guard.pending_journal.push_back(entry.amount);
+                // TODO: writer assigns target_page, target_line
+                journal_entries.push(JournalEntryBytes {
+                    target_book_id: book_id.into(),
+                    target_page: 0u32.into(),
+                    target_line: 0u16.into(),
+                    amount: entry.amount.into(),
+                    ledger_code: entry.ledger_code,
+                });
+            }
+            drop(guard);
+            book_contributions.push(BookContribution {
+                state,
+                entries: journal_entries,
+            });
         }
 
         let nanos_u128: u128 = SystemTime::now()
@@ -176,12 +171,6 @@ impl Acceptor {
             .as_nanos();
         let nanos: u64 = u64::try_from(nanos_u128).expect("timestamp past year 2554");
 
-        let entry_count = u8::try_from(entries.len()).expect("entries exceeded 255"); //safe, we'll be limiting the length at the entry point.
-        let record_length = u16::try_from(
-            size_of::<JournalHeaderBytes>() + (size_of::<JournalEntryBytes>() * entries.len()),
-        )
-        .expect("record length exceeded 65535");
-
         // TODO: identify checksum, prev_hash, operation_id
         let operation_id = 0;
         let checksum = 0;
@@ -189,17 +178,17 @@ impl Acceptor {
 
         let header = JournalHeaderBytes {
             record_length: record_length.into(),
-            entry_count: entry_count,
+            entry_count: total_entry_count,
             operation_id: operation_id.into(),
             timestamp_ns: nanos.into(),
-            idempotency_key: operations.idempotency_key.into_bytes(),
+            idempotency_key: idempotency_key.into_bytes(),
             checksum: checksum.into(),
             prev_hash,
         };
 
         self.buffer.push(WriteCommand {
             header,
-            entries: processed_entries,
+            book_contributions,
             ending_balances,
             response_tx,
         });
@@ -216,7 +205,7 @@ impl Acceptor {
                     in_flight.abort()
                 }
                 for pending in failed_commands.drain(..) {
-                    pending.abort(OperationError::AbortedFromFailedFlush)
+                    pending.abort(OperationError::AbortedFromFailedFlush).await
                 }
             }
         }
@@ -274,15 +263,11 @@ pub(crate) enum OperationError {
     AbortedFromFailedFlush,
     #[error("acceptor dropped response channel")]
     Recv(#[from] oneshot::error::RecvError),
-    #[error("failed to load books")]
-    FailedToLoadBook,
-    #[error("registry task failure")]
-    RegistryFailure,
 }
 
 #[derive(Debug)]
 struct AcceptorCommand {
-    operations: ValidOperation,
+    prepared: PreparedOperation,
     response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
 }
 
@@ -298,17 +283,18 @@ impl AcceptorCommand {
 pub(crate) struct SystemHandles {
     acceptor_tx: mpsc::Sender<AcceptorCommand>,
     account_tx: mpsc::Sender<AccountRegistryCommand>,
+    book_tx: mpsc::Sender<BookRegistryCommand>,
 }
 
 impl SystemHandles {
     pub(crate) async fn submit_operation(
         &self,
-        op: ValidOperation,
+        prepared: PreparedOperation,
     ) -> Result<OperationResult, OperationError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.acceptor_tx
             .send(AcceptorCommand {
-                operations: op,
+                prepared,
                 response_tx: response_sender,
             })
             .await
@@ -318,7 +304,7 @@ impl SystemHandles {
 
     pub(crate) async fn load_accounts(
         &self,
-        ids: Vec<u64>,
+        ids: Vec<AccountId>,
     ) -> Result<HashMap<AccountId, Arc<RwLock<AccountState>>>, AccountLoadError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.account_tx
@@ -330,13 +316,33 @@ impl SystemHandles {
             .map_err(|_| AccountLoadError::AccountNotFound)?;
         response_receiver.await?
     }
+
+    pub(crate) async fn load_books(
+        &self,
+        ids: Vec<BookId>,
+    ) -> Result<HashMap<BookId, Arc<RwLock<BookState>>>, BookLoadError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.book_tx
+            .send(BookRegistryCommand::GetBooks {
+                ids,
+                reply: response_sender,
+            })
+            .await
+            .map_err(|_| BookLoadError::BookNotFound)?;
+        response_receiver
+            .await
+            .map_err(|_| BookLoadError::BookNotFound)?
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum OperationResult {
-    /// Contains the resulting balances after the accepted operation
-    Accepted(HashMap<AccountId, (Currency, BalanceType, i128)>),
+    /// Resulting balances per `(account, currency, balance_type)` triple after the accepted operation.
+    Accepted(HashMap<(AccountId, Currency, BalanceType), i128>),
 
-    /// Contains the AccountId whose balance caused the rejection
+    /// AccountId whose book balance caused the rejection.
     Rejected(AccountId),
+
+    /// BookId whose projected balance would exceed the i128 range.
+    Overflow(BookId),
 }

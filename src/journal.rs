@@ -1,10 +1,11 @@
 use crate::acceptor::{OperationError, OperationResult};
 use crate::accounts::AccountId;
-use crate::books::BalanceType;
+use crate::books::{BalanceType, BookState};
 use crate::currency::Currency;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, oneshot};
-use zerocopy::byteorder::little_endian::{I128, U16, U32, U64, U128};
+use std::sync::Arc;
+use tokio::sync::{RwLock, mpsc, oneshot};
+use zerocopy::byteorder::little_endian::{I128, U16, U32, U64};
 use zerocopy::{Immutable, IntoBytes};
 
 #[derive(IntoBytes, Immutable, Debug)]
@@ -57,7 +58,7 @@ impl JournalWriter {
 
                 // start writing again.
 
-                pending.ack();
+                pending.ack().await;
             }
         }
     }
@@ -68,18 +69,36 @@ pub(crate) type WriterBuffer = Vec<WriteCommand>;
 #[derive(Debug)]
 pub(crate) struct WriteCommand {
     pub(crate) header: JournalHeaderBytes,
-    pub(crate) entries: Vec<JournalEntryBytes>,
-    pub(crate) ending_balances: HashMap<AccountId, (Currency, BalanceType, i128)>,
+    pub(crate) book_contributions: Vec<BookContribution>,
+    pub(crate) ending_balances: HashMap<(AccountId, Currency, BalanceType), i128>,
     pub(crate) response_tx: oneshot::Sender<Result<OperationResult, OperationError>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct BookContribution {
+    pub(crate) state: Arc<RwLock<BookState>>,
+    pub(crate) entries: Vec<JournalEntryBytes>,
+}
+
 impl WriteCommand {
-    pub(crate) fn abort(self, reason: OperationError) {
+    pub(crate) async fn abort(self, reason: OperationError) {
+        for contribution in self.book_contributions {
+            let n = contribution.entries.len();
+            let mut guard = contribution.state.write().await;
+            guard.pending_journal.drain(..n);
+        }
         let _ = self.response_tx.send(Err(reason));
     }
 
-    fn ack(self) {
-        let _ = self.response_tx
+    async fn ack(self) {
+        for contribution in self.book_contributions {
+            let n = contribution.entries.len();
+            let mut guard = contribution.state.write().await;
+            guard.pending_journal.drain(..n);
+            guard.durable_pending_rollup.extend(contribution.entries);
+        }
+        let _ = self
+            .response_tx
             .send(Ok(OperationResult::Accepted(self.ending_balances)));
     }
 }

@@ -1,18 +1,31 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::task::JoinSet;
 
+use crate::accounts::AccountId;
 use crate::journal::JournalEntryBytes;
 
 pub(crate) type BookId = u64;
 pub(crate) type BookRegistryMap = HashMap<BookId, Arc<RwLock<BookState>>>;
 
+#[derive(Debug)]
 pub(crate) struct BookState {
     pub(crate) running_balance: i128,
-    pub(crate) durable_pending_rollup: Vec<JournalEntryBytes>,
-    pub(crate) pending_journal: Vec<JournalEntryBytes>,
+    pub(crate) durable_pending_rollup: VecDeque<JournalEntryBytes>,
+    pub(crate) pending_journal: VecDeque<i128>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InScopeBook {
+    pub(crate) account_id: AccountId,
+    pub(crate) allow_overdraft: bool,
+    pub(crate) state: Arc<RwLock<BookState>>,
 }
 
 pub(crate) struct BookRegistryActor {

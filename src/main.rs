@@ -3,8 +3,8 @@ extern crate rocket;
 
 use std::time::Duration;
 
-mod accounts;
 mod acceptor;
+mod accounts;
 mod api;
 mod books;
 mod currency;
