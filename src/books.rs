@@ -26,23 +26,33 @@ impl BookRegistryActor {
             match cmd {
                 BookRegistryCommand::GetBooks { ids, reply } => {
                     let mut result = HashMap::with_capacity(ids.len());
-
-                    //TODO maybe use join! ?
-                    for id in ids {
-                        let book_arc = self
-                            .map
-                            .entry(id)
-                            .or_insert_with(|| {
-                                //TODO asynchronous load from disk
-                                Arc::new(RwLock::new(BookState {
-                                    running_balance: 0,
-                                    durable_pending_rollup: Vec::new(),
-                                    pending_journal: Vec::new(),
-                                }))
-                            })
-                            .clone();
-                        result.insert(id, book_arc);
+                    let mut to_load = Vec::new();
+                    for id in &ids {
+                        if let Some(book_arc) = self.map.get(id) {
+                            result.insert(*id, book_arc.clone());
+                        } else {
+                            to_load.push(*id);
+                        }
                     }
+
+                    let mut load_set = JoinSet::new();
+                    for id in to_load {
+                        load_set.spawn(async move {
+                            //TODO asynchronous load from disk
+                            let state = Arc::new(RwLock::new(BookState {
+                                running_balance: 0,
+                                durable_pending_rollup: VecDeque::new(),
+                                pending_journal: VecDeque::new(),
+                            }));
+                            (id, state)
+                        });
+                    }
+                    while let Some(joined) = load_set.join_next().await {
+                        let (id, state) = joined.expect("book load task panicked");
+                        self.map.insert(id, state.clone());
+                        result.insert(id, state);
+                    }
+
                     let _ = reply.send(Ok(result));
                 }
                 BookRegistryCommand::Evict(_) => todo!(),
@@ -60,7 +70,7 @@ pub(crate) enum BookLoadError {
 pub(crate) enum BookRegistryCommand {
     GetBooks {
         ids: Vec<BookId>,
-        reply: oneshot::Sender<Result<HashMap<BookId, Arc<RwLock<BookState>>>, BookLoadError>>,
+        reply: oneshot::Sender<Result<BookRegistryMap, BookLoadError>>,
     },
     Evict(BookId),
 }
